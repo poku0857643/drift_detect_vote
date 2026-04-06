@@ -32,4 +32,4 @@ env/
 # Test artefacts
 .pytest_cache/
 .coverage
-htmlcov/
+htmlcov/checkpoints/
