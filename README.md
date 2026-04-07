@@ -1,292 +1,313 @@
-# DriftDetect API
+# DriftDetect
 
-> Detect when your production data has shifted away from what your model was trained on — before it silently degrades.
-
----
-
-## The Problem
-
-Machine learning models are trained on a snapshot of data. Once deployed, the real world keeps changing:
-
-- Customer demographics shift over time
-- Sensor readings drift due to hardware wear
-- Market behaviour changes after economic events
-- Upstream pipelines introduce subtle bugs or schema changes
-
-Most teams only discover this **after** their model's accuracy has already dropped — often days or weeks later. By then the damage (bad predictions, lost revenue, incorrect decisions) is done.
-
-**DriftDetect** monitors your data continuously and raises an alert the moment the distribution starts to change, giving you time to retrain before performance degrades.
+> A three-model voting ensemble for production ML drift detection — covering graph-structured, time-series, and tabular data — with GCP Cloud Monitoring integration.
 
 ---
 
-## How It Works
+## The Problem This System Solves
+
+Production ML models degrade silently. The root causes fall into three distinct categories that **no single detector can cover**:
+
+| Drift type | What changes | Classical blind spot |
+|------------|-------------|----------------------|
+| **Covariate drift** | Individual feature distributions P(X) shift | Detectable by KS/PSI, but only for marginal distributions |
+| **Structural / relational drift** | Relationships between entities shift — P(X, A) — e.g. career graph topology, ECG waveform morphology | KS/PSI **cannot** detect this — they see only flat feature vectors |
+| **Outlier pattern drift** | Novel anomaly clusters appear in production that weren't in training | Statistical tests miss subtle multi-feature combinations |
+
+This system is specifically designed for domains where **relational structure matters** — career progression graphs, physiological monitoring (ECG), and any ML pipeline where entities are connected and their relationships encode meaning. A statistical test on individual features will not catch it when the *pattern of connections* changes, only when individual values change.
+
+### Why one detector is not enough
+
+Each detector has a systematic blind spot:
+
+- A **statistical test** will pass when the marginal distributions look stable but the joint structure has shifted — a classic false negative in graph data.
+- A **GNN** produces low drift scores when individual node features shift without topological change — a false negative for pure covariate drift.
+- A **Random Forest anomaly detector** can miss gradual cluster migration that doesn't produce obvious outliers.
+
+The voting ensemble exists to **combine independent evidence** — requiring agreement across at least two of three orthogonal methods dramatically reduces both false positives and false negatives.
+
+---
+
+## System Architecture
 
 ```
 Your Application
       │
-      │  POST /api/v1/report
-      │  { reference: [...], current: [...] }
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│                    DriftDetect API                      │
-│                                                         │
-│   ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  │
-│   │     GNN     │  │ Statistical  │  │  Isolation  │  │
-│   │  Detector   │  │  Detector    │  │   Forest    │  │
-│   │             │  │              │  │  Detector   │  │
-│   │ Correlation │  │  KS test per │  │  Anomaly    │  │
-│   │ graph +     │  │  feature +   │  │  score      │  │
-│   │ GCN message │  │  Bonferroni  │  │  shift      │  │
-│   │ passing     │  │  correction  │  │  (KS test)  │  │
-│   └──────┬──────┘  └──────┬───────┘  └──────┬──────┘  │
-│          │  DRIFT?        │  DRIFT?          │ DRIFT?  │
-│          ▼                ▼                  ▼         │
-│   ┌────────────────────────────────────────────────┐   │
-│   │              Voting Ensemble                   │   │
-│   │   strategy: majority | unanimous | any         │   │
-│   │   confidence = votes_for_drift / 3             │   │
-│   └────────────────────────┬───────────────────────┘   │
-│                            │                           │
-│              ┌─────────────┴──────────────┐            │
-│              ▼                            ▼            │
-│   ┌──────────────────┐       ┌────────────────────┐    │
-│   │   SQLite DB      │       │   HTML Report      │    │
-│   │                  │       │                    │    │
-│   │ drift_runs       │       │ • Verdict banner   │    │
-│   │ detector_results │       │ • Per-detector     │    │
-│   │ feature_metrics  │       │   cards            │    │
-│   │ optimization_    │       │ • Feature drift    │    │
-│   │   predictions    │       │   table            │    │
-│   └──────────────────┘       │ • Optimization     │    │
-│                              │   recommendation   │    │
-│                              └────────────────────┘    │
-└─────────────────────────────────────────────────────────┘
-      │
-      │  Response: drift_detected, ensemble_score,
-      │            votes, per-feature scores,
-      │            predicted improvement %, HTML url
-      ▼
-Your Application
-(trigger alert / retrain / log)
+      ├── tabular / feature vectors ──►  POST /api/v1/report
+      └── graph data (nodes + edges) ──► POST /drift/gnn
+                                              │
+                    ┌─────────────────────────▼──────────────────────────────┐
+                    │           DriftDetect API  (GCP Cloud Run)             │
+                    │                                                        │
+                    │  ┌─────────────────────────────────────────────────┐  │
+                    │  │              Voting Ensemble                     │  │
+                    │  │   majority | unanimous | any                    │  │
+                    │  │                                                  │  │
+                    │  │  ┌───────────┐  ┌─────────────┐  ┌──────────┐  │  │
+                    │  │  │   GNN     │  │ Statistical  │  │  Random  │  │  │
+                    │  │  │           │  │              │  │  Forest  │  │  │
+                    │  │  │ GATConv   │  │  KS test     │  │          │  │  │
+                    │  │  │ MMD²      │  │  PSI         │  │ Isolation│  │  │
+                    │  │  │ Attention │  │  Wasserstein │  │ Forest   │  │  │
+                    │  │  │ KS test   │  │  Bonferroni  │  │ + LOF    │  │  │
+                    │  │  │ GAE loss  │  │  Fisher      │  │ + SHAP   │  │  │
+                    │  │  └─────┬─────┘  └──────┬───────┘  └────┬─────┘  │  │
+                    │  │        │  vote          │  vote         │  vote  │  │
+                    │  │        └────────────────┴───────────────┘        │  │
+                    │  │                         │                         │  │
+                    │  │              ┌──────────▼──────────┐              │  │
+                    │  │              │   Final Decision     │              │  │
+                    │  │              │   confidence score   │              │  │
+                    │  │              │   feature attribution│              │  │
+                    │  │              └──────────┬──────────┘              │  │
+                    │  └─────────────────────────┼─────────────────────────┘  │
+                    │              ┌─────────────┼──────────────┐             │
+                    │              ▼             ▼              ▼             │
+                    │       ┌────────────┐ ┌──────────┐ ┌────────────────┐   │
+                    │       │ SQLite DB  │ │  HTML    │ │  GCP Cloud     │   │
+                    │       │            │ │  Report  │ │  Monitoring    │   │
+                    │       │ drift_runs │ │          │ │                │   │
+                    │       │ detector_  │ │ verdict  │ │ custom.google  │   │
+                    │       │ results    │ │ per-feat │ │ apis.com/      │   │
+                    │       │ feature_   │ │ scores   │ │ drift/         │   │
+                    │       │ metrics    │ │ opt.     │ │ {metric_name}  │   │
+                    │       │ optim_     │ │ recom.   │ │                │   │
+                    │       │ prediction │ └──────────┘ │ (async, via    │   │
+                    │       └────────────┘              │  BackgroundTask│   │
+                    │                                   └────────────────┘   │
+                    └────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    drift_detected, ensemble_score,
+                    per-detector votes, feature attribution,
+                    predicted improvement %, HTML report URL,
+                    GCP metrics written flag
 ```
 
 ---
 
-## Purpose
+## How the Voting System Works and Why
 
-DriftDetect solves three things at once:
+The three detectors approach drift from entirely different angles. Their combination is not arbitrary — each one plugs the blind spot of the others.
 
-| Goal | How |
-|------|-----|
-| **Early warning** | Catches distribution shift before model accuracy visibly drops |
-| **Root cause** | Pinpoints which features drifted, not just that drift occurred |
-| **Action guidance** | Predicts the % performance improvement you'd gain by retraining |
+### Detector 1 — GNN (Graph Attention Network)
+
+**What it detects:** Structural and relational drift — changes in how entities relate to each other, not just changes in individual values.
+
+**How it works:**
+- Builds a feature-correlation graph (or uses the input graph directly for graph data)
+- GATConv propagates node statistics through learned attention-weighted edges
+- Computes four signals in priority order:
+  1. **MMD²** — Maximum Mean Discrepancy between reference and production node embeddings (threshold: > 0.05)
+  2. **Attention weight KS test** — distribution shift in per-edge α_uv attention weights (threshold: p < 0.05)
+  3. **Cosine distance** — mean embedding vector shift (informational)
+  4. **GAE reconstruction loss** — unsupervised concept drift via graph autoencoder
+
+**Why it works where classical methods fail:** When career graph topology changes (new job categories emerge, promotion paths shift) or ECG waveform relationships change, individual feature distributions may stay stable. GATConv detects the relational shift through its attention mechanism — a signal that is fundamentally invisible to KS/PSI.
 
 ---
 
-## The Three Detectors
+### Detector 2 — Statistical (KS + PSI + Wasserstein)
 
-Each detector approaches drift from a different angle. Requiring agreement across all three reduces false positives.
+**What it detects:** Marginal distribution shift — individual features changing their distribution shape, range, or density.
 
-### 1. GNN (Graph Neural Network)
-Builds a feature-correlation graph where each feature is a node and edges connect correlated features. Multi-layer graph convolution (GCN) propagates statistical node features (mean, std, quantiles, skew, kurtosis) through the reference correlation structure. Drift = the mean per-node embedding distance between reference and current exceeds a bootstrapped threshold.
+**How it works:**
+- **Kolmogorov–Smirnov test** per feature with Bonferroni correction for multiple comparisons
+- **Population Stability Index (PSI)** — industry-standard binned probability shift (flag if > 0.20)
+- **Wasserstein distance** — earth mover's distance normalised by reference std (flag if > 0.20)
+- Fisher's method combines per-feature evidence into a single p-value
+- A feature is flagged if *any* of the three tests fires
 
-*Best at:* structural changes — when the relationships **between** features shift, not just individual feature distributions.
+**Why it's in the ensemble:** Fast, interpretable, and highly sensitive to univariate changes. Acts as a canary — if any single feature is distributing differently, this catches it immediately. Provides the per-feature breakdown needed for root cause analysis.
 
-### 2. Statistical (KS Test + Bonferroni)
-Runs a Kolmogorov–Smirnov two-sample test on every feature independently. Applies Bonferroni correction for multiple comparisons and combines p-values via Fisher's method.
+---
 
-*Best at:* univariate distribution shifts — when one or a few features change their distribution shape.
+### Detector 3 — Random Forest (Isolation Forest + LOF)
 
-### 3. Isolation Forest
-Trains an Isolation Forest on the reference data to define what "normal" looks like. Compares the anomaly score distributions of reference vs current via KS test. Per-feature attribution via score perturbation.
+**What it detects:** Multivariate anomaly pattern drift — novel combinations of features appearing in production that weren't in training, and local cluster migration.
 
-*Best at:* multivariate outlier patterns — when unusual combinations of feature values appear in the current data.
+**How it works:**
+- **Isolation Forest** trained on reference data defines the "normal" manifold. Anomaly score distributions (reference vs production) compared via KS test.
+- **Local Outlier Factor** (LOF, novelty mode) catches local density shifts that IF misses — triggered when production samples are dense in regions sparse in reference.
+- **Marginal SHAP attribution** — each feature's contribution to drift scored by measuring how much the IF score shifts when that feature is replaced with its reference mean.
+
+**Why it's in the ensemble:** Catches the case where no individual feature has shifted, but the *combination* has. A patient whose individual ECG metrics are within normal range but whose joint feature pattern has never been seen before will score high anomaly but low KS — only RF catches this.
+
+---
+
+### Why the Vote Reduces Bias
+
+```
+                    GNN        Statistical     Random Forest
+                     │               │               │
+Structural drift     ✓               ✗               ✗   ← only GNN catches it
+Covariate drift      ✗               ✓               ✗   ← only Stat catches it
+Multivariate drift   ✗               ✗               ✓   ← only RF catches it
+All three            ✓               ✓               ✓   ← clear drift signal
+Two of three         ✓ / ✗           ✓ / ✗          ✓ / ✗ ← majority verdict
+```
+
+With `majority` strategy (default), drift is confirmed when ≥ 2 detectors agree. This means:
+- **False positives** are suppressed — a statistical fluke in one detector is overruled.
+- **False negatives** are suppressed — a blind spot in one detector is covered by another.
+- **Confidence** is quantified as `votes_for_drift / 3`, giving a calibrated signal for alert severity.
+
+---
+
+## Target Data
+
+This system is designed for ML pipelines operating on:
+
+| Domain | Data type | Why this system fits |
+|--------|-----------|---------------------|
+| **Career / HR analytics** | Career progression graphs, skill graphs, job transition networks | GNN detects when graph topology shifts; RF catches novel career patterns |
+| **Clinical / physiological monitoring** | ECG signals, vital sign time series, patient pathway graphs | GNN detects waveform relationship shifts; Statistical catches baseline drift |
+| **Recommendation systems** | User–item interaction graphs, embedding spaces | GNN detects preference graph topology changes; all three validate feature drift |
+| **Any tabular ML model** | Feature vectors at inference time | Statistical + RF cover all standard covariate and concept drift patterns |
+| **Sensor / IoT networks** | Multi-sensor readings with inter-sensor correlations | GNN detects correlation structure shift; Statistical catches per-sensor drift |
+
+The system is **label-free** — it requires only the input feature distributions, not ground-truth labels. This makes it usable in production where labels arrive with a delay or not at all.
 
 ---
 
 ## Setup
 
 ```bash
-# 1. Clone and enter the project
-git clone <repo-url>
-cd drift_detect
-
-# 2. Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
+git clone <repo-url> && cd drift_detect
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 4. Start the server
 uvicorn main:app --reload
 ```
 
-Swagger UI: **http://127.0.0.1:8000/docs**
-Dashboard:  **http://127.0.0.1:8000/api/v1/metrics/dashboard**
+| URL | Description |
+|-----|-------------|
+| http://127.0.0.1:8000/docs | Swagger UI — all endpoints |
+| http://127.0.0.1:8000/api/v1/metrics/dashboard | HTML metrics dashboard |
 
----
-
-## Integrating Into Your Existing Workflow
-
-### Option A — Scheduled batch check (recommended)
-
-Run a drift check on a rolling window of recent production data against your training baseline, on a schedule (e.g. daily cron).
-
-```python
-import httpx
-import pandas as pd
-
-# Load your training baseline and recent production window
-reference = pd.read_parquet("training_data.parquet").sample(500).values.tolist()
-current   = pd.read_parquet("production_last_7d.parquet").sample(500).values.tolist()
-
-response = httpx.post("http://localhost:8000/api/v1/report", json={
-    "reference": reference,
-    "current":   current,
-    "feature_names": ["age", "income", "score", "tenure"],
-    "strategy": "majority",
-    "threshold": 0.05
-})
-
-result = response.json()
-
-if result["drift_detected"]:
-    print(f"DRIFT DETECTED — score: {result['ensemble_score']:.3f}")
-    print(f"Recommendation: {result['optimization']['recommendation']}")
-    print(f"HTML report: http://localhost:8000{result['html_url']}")
-    # trigger_retraining_pipeline()
-    # send_slack_alert(result)
-```
-
-### Option B — Real-time inference monitoring
-
-Accumulate a buffer of recent predictions and compare to your training distribution at each inference batch.
-
-```python
-from collections import deque
-import httpx
-
-REFERENCE = load_training_features()   # your baseline, loaded once
-BUFFER    = deque(maxlen=200)          # rolling window of recent inputs
-
-def predict(features: list[float]) -> float:
-    BUFFER.append(features)
-
-    # Check drift every 200 samples
-    if len(BUFFER) == 200:
-        resp = httpx.post("http://localhost:8000/api/v1/detect", json={
-            "reference": REFERENCE,
-            "current":   list(BUFFER),
-        }).json()
-
-        if resp["drift_detected"]:
-            log_warning("Input drift detected", score=resp["ensemble_score"])
-
-    return model.predict([features])[0]
-```
-
-### Option C — CI/CD data validation gate
-
-Block model promotion if the new training dataset has drifted significantly from the last production baseline.
+### GCP configuration (Cloud Run)
 
 ```bash
-# In your CI pipeline (e.g. GitHub Actions, GitLab CI)
-python scripts/check_drift.py \
-  --reference data/baseline.parquet \
-  --current   data/new_training.parquet \
-  --threshold 0.05 \
-  --fail-on-drift
+export GCS_REFERENCE_GRAPH_PATH="gs://your-bucket/reference_graph.pt"
+export GCP_PROJECT_ID="your-gcp-project"
 ```
 
-```python
-# scripts/check_drift.py
-import sys, httpx, pandas as pd, argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--reference")
-parser.add_argument("--current")
-parser.add_argument("--threshold", type=float, default=0.05)
-parser.add_argument("--fail-on-drift", action="store_true")
-args = parser.parse_args()
-
-ref = pd.read_parquet(args.reference).sample(300).values.tolist()
-cur = pd.read_parquet(args.current).sample(300).values.tolist()
-
-result = httpx.post("http://localhost:8000/api/v1/detect", json={
-    "reference": ref, "current": cur, "threshold": args.threshold
-}).json()
-
-print(f"Drift detected: {result['drift_detected']}  score: {result['ensemble_score']:.3f}")
-if result["drift_detected"] and args.fail_on_drift:
-    sys.exit(1)   # fail the pipeline
-```
+The service account running the container needs only `roles/monitoring.metricWriter`. GCP metrics are written asynchronously via `BackgroundTasks` — they never block the API response.
 
 ---
 
 ## API Reference
 
-### `POST /api/v1/detect`
-Run the three-model ensemble. Returns voting result. **Nothing is stored.**
+### Tabular drift detection
+
+**`POST /api/v1/detect`** — run ensemble, no persistence
+
+**`POST /api/v1/report`** — run ensemble, persist to SQLite, generate HTML report
 
 ```json
-// Request
 {
-  "reference":     [[...], [...]],   // baseline samples (≥5 rows)
-  "current":       [[...], [...]],   // new samples to check (≥5 rows)
-  "feature_names": ["f1", "f2"],     // optional — auto-named if omitted
-  "strategy":      "majority",       // "majority" | "unanimous" | "any"
-  "threshold":     0.05              // significance level (default 0.05)
-}
-
-// Response
-{
-  "drift_detected":  true,
-  "strategy":        "majority",
-  "votes_for_drift": 3,
-  "total_detectors": 3,
-  "confidence":      1.0,
-  "ensemble_score":  0.98,
-  "feature_scores":  { "age": 0.41, "income": 0.38, "score": 0.21 },
-  "detector_results": [ ... ]
+  "reference":     [[25, 50000, 0.8], ...],
+  "current":       [[45, 90000, 0.3], ...],
+  "feature_names": ["age", "salary", "engagement"],
+  "strategy":      "majority",
+  "threshold":     0.05
 }
 ```
 
-### `POST /api/v1/report`
-Same as `/detect` but also **persists to SQLite** and generates an HTML report.
-Response includes `html_url` and `optimization.predicted_improvement_pct`.
+**`GET /api/v1/report/{run_id}/html`** — view rendered HTML report
 
-### `GET /api/v1/report/{run_id}/html`
-View the full HTML drift report in a browser.
+---
 
-### `GET /api/v1/metrics/dashboard`
-Interactive HTML dashboard — drift rate over time, detector agreement, top drifted features, run history table.
+### Graph drift detection
 
-### `GET /api/v1/metrics/performance`
+**`POST /drift/gnn`** — GATConv four-signal detector with GCP logging
+
 ```json
 {
-  "total_runs": 42,
-  "drift_detected_count": 11,
-  "drift_rate": 0.262,
-  "detector_agreement_rate": 0.857,
-  "avg_ensemble_score": 0.34,
-  "avg_predicted_improvement_pct": 12.4,
-  "most_drifted_features": ["income", "age", "score"]
+  "node_features": [[0.2, 1.4, ...], ...],
+  "edge_index":    [[0, 1, 2, ...], [1, 2, 0, ...]]
 }
+```
+
+Response:
+```json
+{
+  "drift_detected": true,
+  "signals": {
+    "mmd2": 0.071,
+    "attention_ks_stat": 0.43,
+    "attention_ks_p": 0.002,
+    "cosine_distance": 0.18,
+    "gae_reconstruction_loss": 0.94
+  },
+  "thresholds": { "mmd2": 0.05, "ks_p": 0.05 },
+  "gcp_logged": true
+}
+```
+
+GCP custom metrics written (async):
+- `custom.googleapis.com/drift/mmd2`
+- `custom.googleapis.com/drift/attention_ks_stat`
+- `custom.googleapis.com/drift/cosine_distance`
+- `custom.googleapis.com/drift/gae_reconstruction_loss`
+- `custom.googleapis.com/drift/drift_detected`
+
+---
+
+### Metrics & dashboard
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/metrics` | Paginated run history |
+| `GET` | `/api/v1/metrics/performance` | Drift rate, detector agreement, avg improvement |
+| `GET` | `/api/v1/metrics/dashboard` | Interactive HTML dashboard |
+| `GET` | `/api/v1/metrics/{run_id}` | Single run detail |
+
+---
+
+## Integrating Into Your Pipeline
+
+```python
+import httpx, pandas as pd
+
+reference = pd.read_parquet("training_data.parquet").sample(500).values.tolist()
+current   = pd.read_parquet("production_window.parquet").sample(500).values.tolist()
+
+result = httpx.post("https://your-cloud-run-url/api/v1/report", json={
+    "reference": reference,
+    "current":   current,
+    "feature_names": ["age", "salary", "engagement"],
+    "strategy": "majority"
+}).json()
+
+if result["drift_detected"]:
+    print(result["optimization"]["recommendation"])
+    # → retrain, alert, investigate top drifted features
 ```
 
 ---
 
-## Optimization Ratio
+## Project Structure
 
-Every `/report` response includes a predicted performance improvement estimate — how much better your model could perform if you retrained it to account for the detected drift.
-
-| Ensemble score | Estimated improvement |
-|----------------|-----------------------|
-| 0.0 – 0.2      | 0 – 4 %               |
-| 0.2 – 0.5      | 4 – 15 %              |
-| 0.5 – 0.8      | 15 – 33 %             |
-| 0.8 – 1.0      | 33 – 45 %             |
-
-This is a calibrated heuristic, not a guarantee — treat it as a prioritisation signal.
+```
+app/
+├── detectors/
+│   ├── base.py              # Abstract DriftDetector + DetectorResult
+│   ├── gnn.py               # Numpy GCN — tabular feature-correlation graph
+│   ├── gnn_gat.py           # GATConv — graph-structured inputs (PyTorch Geometric)
+│   ├── statistical.py       # KS + PSI + Wasserstein
+│   └── isolation.py         # Isolation Forest + LOF + marginal SHAP
+├── ensemble/
+│   └── voting.py            # VotingEnsemble (majority / unanimous / any)
+├── gcp/
+│   └── monitoring.py        # GCP Cloud Monitoring metric writer
+├── db/
+│   ├── models.py            # SQLAlchemy ORM — 4 tables
+│   └── crud.py              # save_run, list_runs, get_performance_summary
+├── reports/
+│   ├── optimizer.py         # Predicted improvement % from drift correction
+│   └── renderer.py          # Self-contained HTML report
+└── routers/
+    ├── drift.py             # /api/v1/detect, /report, /report/{id}/html
+    ├── drift_gnn.py         # /drift/gnn  (GATConv + GCP)
+    └── metrics.py           # /api/v1/metrics/*
+```
