@@ -141,8 +141,20 @@ def main() -> None:
         logger.info("Loading reference graph from GCS: %s", args.graph)
         graph = load_from_gcs(args.graph)
     else:
+        path = Path(args.graph)
+        if not path.exists():
+            logger.error(
+                "Graph file not found: %s\n\n"
+                "  To train on a demo graph run:\n"
+                "    python scripts/train_gat.py --demo --out %s\n\n"
+                "  To build a graph from your own data (CSV / parquet / npy) run:\n"
+                "    python scripts/create_graph.py --input your_data.csv --out data/reference_graph.pt\n"
+                "  Then pass --graph data/reference_graph.pt to this script.",
+                args.graph, args.out,
+            )
+            sys.exit(1)
         logger.info("Loading reference graph from: %s", args.graph)
-        graph = torch.load(args.graph, map_location="cpu", weights_only=False)
+        graph = torch.load(str(path), map_location="cpu", weights_only=False)
 
     logger.info(
         "Reference graph — nodes=%d  edges=%d  features=%d",
