@@ -51,8 +51,11 @@ def _psi(reference_col: np.ndarray, current_col: np.ndarray, n_bins: int = 10) -
     if len(bin_edges) < 2:
         return 0.0
 
-    ref_counts, _ = np.histogram(reference_col, bins=bin_edges)
-    cur_counts, _ = np.histogram(current_col,   bins=bin_edges)
+    # Extend with -inf / +inf so that values outside the reference range are
+    # captured rather than silently dropped by np.histogram.
+    bins_ext = np.concatenate([[-np.inf], bin_edges[1:-1], [np.inf]])
+    ref_counts, _ = np.histogram(reference_col, bins=bins_ext)
+    cur_counts, _ = np.histogram(current_col,   bins=bins_ext)
 
     # Smooth to avoid log(0)
     ref_pct = (ref_counts + 0.5) / (ref_counts.sum() + 0.5 * len(ref_counts))

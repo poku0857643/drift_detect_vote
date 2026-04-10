@@ -36,6 +36,11 @@ class VotingResult:
     detector_results: list[DetectorResult]
     feature_scores: dict[str, float] = field(default_factory=dict)
 
+    def __post_init__(self):
+        self.drift_detected = bool(self.drift_detected)
+        self.confidence = float(self.confidence)
+        self.ensemble_score = float(self.ensemble_score)
+
 
 class VotingEnsemble:
     """

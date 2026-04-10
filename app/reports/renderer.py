@@ -36,7 +36,7 @@ def _detector_card(dr, accent: str) -> str:
         else ""
     )
     meta_rows = "".join(
-        f"<tr><td>{k}</td><td>{v:.4f if isinstance(v, float) else v}</td></tr>"
+        f"<tr><td>{k}</td><td>{f'{v:.4f}' if isinstance(v, float) else v}</td></tr>"
         for k, v in dr.meta.items()
         if not isinstance(v, dict) and k not in ("per_feature_p",)
     )

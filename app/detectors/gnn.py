@@ -171,7 +171,11 @@ class GNNDriftDetector(DriftDetector):
         self._P = self._build_prop_matrix(reference)
 
         X_ref = self._node_features(reference)
-        self._X_scale = np.maximum(X_ref.std(axis=0), 1e-9)
+        # Scale by the mean absolute value per statistic column; floor at 1.0
+        # to prevent amplification when all features have similar statistics
+        # (iid data).  This normalises only when features genuinely differ in
+        # magnitude (e.g. age in thousands vs a binary flag).
+        self._X_scale = np.maximum(np.abs(X_ref).mean(axis=0), 1.0)
         self._ref_emb = self._multi_scale_embed(X_ref / self._X_scale)
 
         # Bootstrap threshold: 3× within-distribution half-split variance
